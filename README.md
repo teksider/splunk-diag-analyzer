@@ -117,8 +117,29 @@ Features:
 - **Resource stats grid** — disk, ulimit, process inventory
 - **App inventory table** — sortable list of installed apps
 - **Recommendations** — prioritized action items
+- **Configuration precedence (btool-style)** — see which config files win when stanzas conflict
 - **Mobile responsive** — works on any screen size
 - **Zero dependencies** — single HTML file, no external CSS/JS
+
+### Configuration Precedence Analysis (btool-style)
+
+When the same `.conf` file exists in multiple locations (e.g., `system/local/inputs.conf` and `apps/TA-weblogs/local/inputs.conf`), Splunk loads them in a specific precedence order. This tool automatically resolves which file's settings win for each stanza and key:
+
+| Precedence | Location | Priority |
+|------------|----------|----------|
+| Highest | `etc/system/local/` | 4 |
+| ↑ | `etc/apps/<app>/local/` | 3 |
+| ↓ | `etc/apps/<app>/default/` | 2 |
+| Lowest | `etc/system/default/` | 1 |
+
+Within the same priority level, apps are loaded alphabetically — **later = higher precedence**.
+
+The analyzer reports:
+- **Key shadowing** — when a higher-precedence file overrides a key from a lower one
+- **File precedence chain** — shows the full load order for each `.conf` file
+- **Winner identification** — which file's value is actually active
+
+This is especially useful for triaging issues where a setting in `system/local/` silently overrides what you configured in an app's `local/` directory.
 
 ### Verbose Mode
 Print detailed per-log-file analysis during processing.

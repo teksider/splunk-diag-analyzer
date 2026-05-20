@@ -59,6 +59,7 @@ class AnalysisReport:
     app_inventory: list = field(default_factory=list)
     topology_clues: list = field(default_factory=list)
     recommendations: list = field(default_factory=list)
+    btool_resolution: dict = field(default_factory=lambda: defaultdict(list))  # conf_file -> [stanza_resolution]
 
 
 # ─── Error/Warning Pattern Definitions ──────────────────────────────────────
@@ -425,11 +426,11 @@ class SplunkDiagAnalyzer:
                         if check["rec"]:
                             self.report.recommendations.append(f"[{check['severity']}] {check['rec']}")
 
-        # Additional config analysis: check for conflicting stanzas
-        self._check_config_conflicts()
-
         # Check indexes.conf for storage issues
         self._check_indexes()
+
+        # Resolve btool-style configuration precedence
+        self._resolve_btool_precedence()
 
     def _check_config_conflicts(self):
         """Look for potential config conflicts across apps."""
@@ -480,6 +481,207 @@ class SplunkDiagAnalyzer:
                     description=f"Allocated across {len(volumes)} volumes: {', '.join(f'{k}={v}MB' for k, v in volumes.items())}",
                     file_path=rel_path,
                 ))
+
+    # ─── Btool-style Precedence Resolution ─────────────────────────────────────
+
+    # Splunk config directory precedence (highest to lowest)
+    BTOLLAYER_PRIORITY = {
+        "system/local":    4,
+        "app/local":       3,
+        "app/default":     2,
+        "system/default":  1,
+    }
+
+    def _classify_conf_path(self, rel_path: str) -> tuple:
+        """Classify a conf file path into (layer, app_name, priority).
+
+        Returns layer name like 'system/local', app name or '', and priority int.
+        """
+        parts = Path(rel_path).parts
+        # Normalize: find the etc/ segment and look at what follows
+        try:
+            etc_idx = parts.index("etc")
+        except ValueError:
+            return ("unknown", "", 0)
+
+        after_etc = parts[etc_idx + 1:]
+
+        # system/local or system/default
+        if len(after_etc) >= 2 and after_etc[0] == "system":
+            sub = after_etc[1]  # local or default
+            return (f"system/{sub}", "", self.BTOLLAYER_PRIORITY.get(f"system/{sub}", 0))
+
+        # apps/<app>/local or apps/<app>/default
+        if len(after_etc) >= 3 and after_etc[0] == "apps":
+            app_name = after_etc[1]
+            sub = after_etc[2]  # local or default
+            return (f"app/{sub}", app_name, self.BTOLLAYER_PRIORITY.get(f"app/{sub}", 0))
+
+        return ("unknown", "", 0)
+
+    def _parse_conf_stanzas(self, content: str) -> dict:
+        """Parse a .conf file into {stanza_name: {key: value}}.
+
+        Handles Splunk .conf format:
+        - [stanza_name]
+        - key = value
+        - Continuation lines (leading whitespace)
+        - Comments (#)
+        """
+        stanzas: dict = {}
+        current_stanza = None
+        current_keys: dict = {}
+
+        for line in content.splitlines():
+            stripped = line.strip()
+
+            # Skip comments and blank lines
+            if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+                continue
+
+            # Stanza header
+            stanza_match = re.match(r"^\[(.+?)\]\s*$", stripped)
+            if stanza_match:
+                # Save previous stanza
+                if current_stanza is not None:
+                    stanzas[current_stanza] = current_keys
+                current_stanza = stanza_match.group(1).strip()
+                current_keys = {}
+                continue
+
+            # Key = value (with possible continuation)
+            kv_match = re.match(r"^(\S[\w\.\-]*)\s*=\s*(.*)", stripped)
+            if kv_match and current_stanza is not None:
+                key = kv_match.group(1)
+                value = kv_match.group(2).strip()
+                # Handle continuation lines (leading whitespace in original)
+                current_keys[key] = value
+            elif current_stanza is not None and stripped and line[0] in " \t":
+                # Continuation of previous value — append
+                last_key = list(current_keys.keys())[-1] if current_keys else None
+                if last_key:
+                    current_keys[last_key] += "\n" + stripped
+
+        # Save last stanza
+        if current_stanza is not None:
+            stanzas[current_stanza] = current_keys
+
+        return stanzas
+
+    def _resolve_btool_precedence(self):
+        """Resolve configuration file precedence across all .conf files in the diag.
+
+        This mimics Splunk's btool behavior: for each .conf file name found in
+        multiple locations, determine which file wins for each stanza and key
+        based on Splunk's directory precedence rules.
+        """
+        print(f"[*] Resolving configuration precedence (btool-style)...")
+
+        # Discover all .conf files
+        conf_files_by_name: dict = defaultdict(list)
+        for root, dirs, files in os.walk(self.diag_root):
+            for f in files:
+                if f.endswith(".conf"):
+                    full_path = Path(root) / f
+                    rel_path = str(full_path.relative_to(self.diag_root))
+                    conf_files_by_name[f].append((rel_path, full_path))
+
+        # Sort each group by precedence (highest last, so last-wins)
+        conf_names_with_multiples = {}
+        for conf_name, file_list in sorted(conf_files_by_name.items()):
+            # Classify and sort by priority
+            classified = []
+            for rel_path, full_path in file_list:
+                layer, app, priority = self._classify_conf_path(rel_path)
+                classified.append((rel_path, full_path, layer, app, priority))
+
+            # Sort: lower priority first, then alphabetical within same priority
+            # (Splunk loads apps alphabetically, so later = higher precedence)
+            classified.sort(key=lambda x: (x[4], x[3], x[0]))
+
+            if len(classified) > 1:
+                conf_names_with_multiples[conf_name] = classified
+
+        if not conf_names_with_multiples:
+            print(f"[+] No overlapping .conf files found — no precedence conflicts.")
+            return
+
+        total_conflicts = 0
+
+        for conf_name, file_list in conf_names_with_multiples.items():
+            stanza_resolution = []
+
+            # Parse all files and collect stanzas
+            all_stanzas: dict = {}  # stanza_name -> [(rel_path, layer, app, keys_dict)]
+
+            for rel_path, full_path, layer, app, priority in file_list:
+                try:
+                    content = full_path.read_text(errors="replace")
+                    stanzas = self._parse_conf_stanzas(content)
+                    for stanza_name, keys in stanzas.items():
+                        if stanza_name not in all_stanzas:
+                            all_stanzas[stanza_name] = []
+                        all_stanzas[stanza_name].append((rel_path, layer, app, priority, keys))
+                except Exception:
+                    pass
+
+            # For each stanza that appears in multiple files, resolve precedence
+            for stanza_name, sources in sorted(all_stanzas.items()):
+                if len(sources) < 2:
+                    continue
+
+                # The last entry (highest priority) wins
+                winner_rel, winner_layer, winner_app, winner_pri, winner_keys = sources[-1]
+
+                # Check for key-level shadowing
+                shadowed_keys = []
+                for src_rel, src_layer, src_app, src_pri, src_keys in sources[:-1]:
+                    for key in src_keys:
+                        if key in winner_keys:
+                            shadowed_keys.append({
+                                "key": key,
+                                "winner_value": winner_keys[key],
+                                "winner_file": winner_rel,
+                                "winner_layer": winner_layer,
+                                "shadowed_file": src_rel,
+                                "shadowed_layer": src_layer,
+                                "shadowed_value": src_keys[key],
+                            })
+
+                if shadowed_keys:
+                    total_conflicts += len(shadowed_keys)
+                    stanza_resolution.append({
+                        "stanza": stanza_name,
+                        "conf_file": conf_name,
+                        "winner_file": winner_rel,
+                        "winner_layer": winner_layer,
+                        "source_count": len(sources),
+                        "shadowed_keys": shadowed_keys,
+                    })
+
+                    # Add a finding for significant conflicts
+                    key_names = ", ".join(s["key"] for s in shadowed_keys[:5])
+                    if len(shadowed_keys) > 5:
+                        key_names += f" (+{len(shadowed_keys) - 5} more)"
+
+                    self.report.findings.append(Finding(
+                        severity="WARNING",
+                        category="config",
+                        title=f"btool: [{stanza_name}] key shadowing in {conf_name}",
+                        description=f"{len(shadowed_keys)} key(s) overridden: {key_names}. "
+                                    f"Winner: {winner_rel} ({winner_layer})",
+                        evidence="\n".join(
+                            f"  [{s['shadowed_layer']}] {s['shadowed_file']}: {s['key']} = {s['shadowed_value'][:80]}"
+                            for s in shadowed_keys[:3]
+                        ),
+                        recommendation=f"Verify {winner_rel} has the intended settings. "
+                                       f"Use `splunk btool {conf_name} list --debug` on the live system.",
+                    ))
+
+            self.report.btool_resolution[conf_name] = stanza_resolution
+
+        print(f"[+] Btool precedence analysis: {len(conf_names_with_multiples)} .conf files with overlap, "
+              f"{total_conflicts} key-level conflicts found.")
 
     def _analyze_logs(self):
         """Analyze log files for error and warning patterns."""
@@ -1009,6 +1211,66 @@ def generate_markdown_report(report: AnalysisReport) -> str:
     lines.append("**Note:** This analysis is based on a snapshot in time. Some errors may be transient or resolved. Always correlate findings with the actual issue timeline.")
     lines.append("")
 
+    # ── Btool-style Precedence Analysis ──
+    if report.btool_resolution:
+        lines.append("## 🔧 Configuration Precedence (btool-style)")
+        lines.append("")
+        lines.append("Splunk loads configuration files in a specific order. When the same stanza/key")
+        lines.append("exists in multiple files, **higher-precedence files override lower ones**.")
+        lines.append("")
+        lines.append("**Precedence order (highest → lowest):**")
+        lines.append("1. `etc/system/local/` — highest priority")
+        lines.append("2. `etc/apps/<app>/local/` — per-app overrides")
+        lines.append("3. `etc/apps/<app>/default/` — app defaults")
+        lines.append("4. `etc/system/default/` — system defaults, lowest priority")
+        lines.append("")
+
+        for conf_name, stanzas in sorted(report.btool_resolution.items()):
+            if not stanzas:
+                continue
+
+            total_shadowed = sum(len(s["shadowed_keys"]) for s in stanzas)
+            lines.append(f"### `{conf_name}` — {len(stanzas)} stanzas with conflicts, {total_shadowed} keys shadowed")
+            lines.append("")
+
+            # Show file precedence chain
+            lines.append(f"**Files involved (lowest → highest precedence):**")
+            lines.append("")
+            for s in stanzas[:1]:  # Use any stanza to show the chain
+                # Collect all source files from shadowed_keys
+                seen_files = set()
+                for sk in s["shadowed_keys"]:
+                    file_key = (sk["shadowed_file"], sk["shadowed_layer"])
+                    if file_key not in seen_files:
+                        seen_files.add(file_key)
+                        layer_icon = {"system/local": "🏆", "app/local": "📝", "app/default": "📦", "system/default": "⚙️"}.get(sk["shadowed_layer"], "❓")
+                        lines.append(f"  {layer_icon} `{sk['shadowed_file']}` ({sk['shadowed_layer']})")
+                winner_icon = "🏆" if s["winner_layer"] == "system/local" else "📝" if s["winner_layer"] == "app/local" else "📦" if s["winner_layer"] == "app/default" else "⚙️"
+                lines.append(f"  {winner_icon} `{s['winner_file']}` ({s['winner_layer']}) ← **WINNER**")
+            lines.append("")
+
+            # Show each conflicted stanza
+            for entry in stanzas:
+                lines.append(f"#### `[{entry['stanza']}]`")
+                lines.append("")
+                lines.append(f"Source files: {entry['source_count']} | Shadowed keys: {len(entry['shadowed_keys'])}")
+                lines.append("")
+                lines.append("| Key | Winner Value | Winner File | Overridden File | Overridden Value |")
+                lines.append("|-----|-------------|-------------|-----------------|------------------|")
+                for sk in entry["shadowed_keys"]:
+                    wv = sk["winner_value"][:60] + ("…" if len(sk["winner_value"]) > 60 else "")
+                    sv = sk["shadowed_value"][:60] + ("…" if len(sk["shadowed_value"]) > 60 else "")
+                    wf = sk["winner_file"].split("/")[-3:]  # Show just the relevant path parts
+                    sf = sk["shadowed_file"].split("/")[-3:]
+                    lines.append(f"| `{sk['key']}` | `{wv}` | `/{'/'.join(wf)}` | `/{'/'.join(sf)}` | `{sv}` |")
+                lines.append("")
+
+        lines.append("---")
+        lines.append("")
+        lines.append("> 💡 **Tip:** Run `splunk btool <conf_name> list --debug` on the live system")
+        lines.append("> to verify these findings match the active configuration.")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -1045,6 +1307,9 @@ def generate_json_report(report: AnalysisReport) -> str:
         "resource_stats": report.resource_stats,
         "app_inventory": report.app_inventory,
         "recommendations": report.recommendations,
+        "btool_resolution": {
+            k: v for k, v in report.btool_resolution.items()
+        },
     }
     return json.dumps(data, indent=2)
 
@@ -1163,6 +1428,37 @@ def generate_html_report(report: AnalysisReport) -> str:
     for i, rec in enumerate(report.recommendations, 1):
         rec_escaped = rec.replace("&", "&amp;").replace("<", "&lt;")
         recs_html += f'<li>{rec_escaped}</li>\n'
+
+    # Build btool precedence section
+    btool_html = ""
+    if report.btool_resolution:
+        for conf_name, stanzas in sorted(report.btool_resolution.items()):
+            if not stanzas:
+                continue
+            total_shadowed = sum(len(s["shadowed_keys"]) for s in stanzas)
+            conf_escaped = conf_name.replace("&", "&amp;")
+            btool_html += f"""
+    <details class="btool-section">
+      <summary>🔧 <code>{conf_escaped}</code> — {len(stanzas)} stanza(s) with conflicts, {total_shadowed} key(s) shadowed</summary>
+"""
+            for entry in stanzas:
+                stanza_escaped = entry["stanza"].replace("&", "&amp;").replace("<", "&lt;")
+                winner_escaped = entry["winner_file"].replace("&", "&amp;")
+                btool_html += f"""
+      <details class="btool-stanza">
+        <summary><code>[{stanza_escaped}]</code> from {entry['source_count']} files</summary>
+        <table><thead><tr><th>Key</th><th>Winner Value</th><th>Winner</th><th>Shadowed Value</th><th>Shadowed</th></tr></thead><tbody>
+"""
+                for sk in entry["shadowed_keys"]:
+                    key_esc = sk["key"].replace("&", "&amp;").replace("<", "&lt;")
+                    wv_esc = sk["winner_value"][:80].replace("&", "&amp;").replace("<", "&lt;")
+                    sv_esc = sk["shadowed_value"][:80].replace("&", "&amp;").replace("<", "&lt;")
+                    wf_esc = sk["winner_file"].split("/")[-3:]
+                    sf_esc = sk["shadowed_file"].split("/")[-3:]
+                    btool_html += f'<tr><td><code>{key_esc}</code></td><td title="{wv_esc}">{wv_esc}</td><td><code>{"/".join(wf_esc)}</code></td><td title="{sv_esc}">{sv_esc}</td><td><code>{"/".join(sf_esc)}</code></td></tr>\n'
+                btool_html += """</tbody></table></details>
+"""
+            btool_html += "</details>\n"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1427,6 +1723,71 @@ def generate_html_report(report: AnalysisReport) -> str:
     padding-left: 0.25rem;
   }}
 
+  /* Btool precedence */
+  .btool-section {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    overflow: hidden;
+  }}
+  .btool-section > summary {{
+    padding: 1rem 1.2rem;
+    cursor: pointer;
+    font-weight: 600;
+    user-select: none;
+    font-size: 1rem;
+  }}
+  .btool-section > summary:hover {{ background: var(--bg-hover); }}
+  .btool-section code {{
+    background: var(--code-bg);
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    color: var(--accent);
+  }}
+  .btool-stanza {{
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin: 0.75rem 1rem 1rem;
+    overflow: hidden;
+  }}
+  .btool-stanza summary {{
+    padding: 0.75rem 1rem;
+    cursor: pointer;
+    font-weight: 500;
+    user-select: none;
+  }}
+  .btool-stanza summary:hover {{ background: var(--bg-hover); }}
+  .btool-stanza table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }}
+  .btool-stanza th {{
+    background: var(--bg-hover);
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }}
+  .btool-stanza td {{
+    padding: 0.4rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 0.78rem;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .btool-stanza td[title] {{ cursor: help; }}
+  .btool-stanza tr:last-child td {{ border-bottom: none; }}
+
   /* Footer */
   .footer {{
     text-align: center;
@@ -1509,6 +1870,8 @@ def generate_html_report(report: AnalysisReport) -> str:
 {f'<div class="section-title">📦 App Inventory ({len(report.app_inventory)} apps)</div><table class="app-table"><thead><tr><th>Name</th><th>Label</th><th>Version</th><th class="center">Enabled</th></tr></thead><tbody>{app_rows}</tbody></table>' if app_rows else ''}
 
 {f'<div class="section-title">💡 Recommendations</div><ol class="recommendations">{recs_html}</ol>' if recs_html else ''}
+
+{f'<div class="section-title">🔧 Configuration Precedence (btool-style)</div>{btool_html}' if btool_html else ''}
 
 <div class="footer">
   Generated by <strong>splunk-diag-analyzer</strong> — <a href="https://github.com/teksider/splunk-diag-analyzer">github.com/teksider/splunk-diag-analyzer</a><br>

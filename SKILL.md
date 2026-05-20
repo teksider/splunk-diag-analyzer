@@ -45,6 +45,23 @@ python3 src/splunk_diag_analyzer/tui.py diag-file.tar.gz
 
 ## What It Detects
 
+| Category | Examples |
+|----------|----------|
+| 🔴 **Critical** | License issues, disk full, queues blocked, replication failures, data corruption, process crashes |
+| 🟡 **Warnings** | Deprecated settings (SHOULD_LINEMERGE), oversized logs, KV Store disabled, **btool key shadowing** |
+| 🔵 **Info** | Deployment type, version, topology clues, resource stats |
+
+## Configuration Precedence (btool-style)
+
+Automatically resolves which `.conf` file wins when the same stanza exists in multiple locations:
+
+- **`system/local/`** → highest priority
+- **`apps/<app>/local/`** → per-app overrides
+- **`apps/<app>/default/`** → app defaults
+- **`system/default/`** → lowest priority
+
+Reports key-level shadowing, file precedence chains, and which file's value is actually active. Included in all output formats (markdown, JSON, HTML).
+
 ### Critical
 - License quota exceeded or violations
 - Index frozen data (data loss)
