@@ -103,6 +103,23 @@ Machine-readable for pipeline integration, dashboard ingestion, or custom toolin
 python3 -m splunk_diag_analyzer diag.tar.gz --json -o report.json
 ```
 
+### Dark HTML Report
+A self-contained, dark-themed HTML dashboard with severity cards, collapsible log sections, and a responsive layout. Opens in any browser — no server needed.
+
+```bash
+python3 -m splunk_diag_analyzer diag.tar.gz --html -o report.html
+```
+
+Features:
+- **Summary cards** — critical/warning/info counts at a glance
+- **Severity badges** — color-coded findings with evidence snippets
+- **Collapsible logs** — expandable error/warning tables per log file
+- **Resource stats grid** — disk, ulimit, process inventory
+- **App inventory table** — sortable list of installed apps
+- **Recommendations** — prioritized action items
+- **Mobile responsive** — works on any screen size
+- **Zero dependencies** — single HTML file, no external CSS/JS
+
 ### Verbose Mode
 Print detailed per-log-file analysis during processing.
 
@@ -113,7 +130,7 @@ python3 -m splunk_diag_analyzer diag.tar.gz --verbose
 ## CLI Reference
 
 ```
-usage: __main__.py [-h] [--output FILE] [--json] [--verbose] [--max-log-lines N] diag_file
+usage: __main__.py [-h] [--output FILE] [--json] [--html] [--verbose] [--max-log-lines N] diag_file
 
 positional arguments:
   diag_file             Path to the Splunk diag .tar.gz file
@@ -122,6 +139,7 @@ options:
   -h, --help            Show this help message
   -o, --output FILE     Output file path (default: stdout)
   -j, --json            Output as JSON instead of markdown
+  -H, --html            Output as dark-themed HTML report
   -v, --verbose         Include detailed log output
   --max-log-lines N     Maximum log lines to analyze per file (default: 10000)
 ```

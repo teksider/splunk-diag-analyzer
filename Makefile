@@ -37,9 +37,17 @@ DIAG_FILE ?=
 analyze:
 	PYTHONPATH=src python3 -m splunk_diag_analyzer $(DIAG_FILE) -o report.md
 
+# Generate HTML report
+html:
+	PYTHONPATH=src python3 -m splunk_diag_analyzer $(DIAG_FILE) --html -o report.html
+
 # Quick usage without any setup
 quick:
 	python3 src/splunk_diag_analyzer/__main__.py $(DIAG_FILE)
+
+# Quick HTML report
+quick-html:
+	python3 src/splunk_diag_analyzer/__main__.py $(DIAG_FILE) --html -o report.html
 
 # Launch the TUI (terminal UI) for interactive diag browsing
 tui:

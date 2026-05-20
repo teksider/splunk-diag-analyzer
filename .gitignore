@@ -45,6 +45,7 @@ secrets/
 *.pem
 
 # Reports (generated output)
+# *.md ignored except key docs
 *.md
 !README.md
 !CONTRIBUTING.md

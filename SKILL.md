@@ -1,6 +1,6 @@
 ---
 name: splunk-diag-analyzer
-description: "Use when a Splunk admin needs to pre-triage a Splunk diagnostic (diag) archive before sending to Splunk Support. Deeply analyzes configs, logs, resource stats, and security posture inside .tgz diag files — produces a structured markdown report with critical/warning/info findings, evidence, and actionable recommendations. Zero dependencies, stdlib-only Python."
+description: "Use when a Splunk admin needs to pre-triage a Splunk diagnostic (diag) archive before sending to Splunk Support. Deeply analyzes configs, logs, resource stats, and security posture inside .tgz diag files — produces markdown, JSON, or dark-themed HTML reports with critical/warning/info findings, evidence, and actionable recommendations. Zero dependencies, stdlib-only Python."
 version: 1.0.0
 author: Hermes Agent
 license: Apache-2.0
@@ -33,8 +33,14 @@ python3 src/splunk_diag_analyzer/__main__.py diag-file.tar.gz -o report.md
 pip install -e .
 splunk-diag-analyzer diag-file.tar.gz -o report.md
 
+# Dark HTML report (recommended for sharing with team)
+python3 src/splunk_diag_analyzer/__main__.py diag-file.tar.gz --html -o report.html
+
 # JSON output for programmatic consumption
 python3 src/splunk_diag_analyzer/__main__.py diag-file.tar.gz --json
+
+# Interactive TUI for log browsing
+python3 src/splunk_diag_analyzer/tui.py diag-file.tar.gz
 ```
 
 ## What It Detects

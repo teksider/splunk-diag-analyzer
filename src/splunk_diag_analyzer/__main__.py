@@ -1049,6 +1049,478 @@ def generate_json_report(report: AnalysisReport) -> str:
     return json.dumps(data, indent=2)
 
 
+def generate_html_report(report: AnalysisReport) -> str:
+    """Generate a dark-themed HTML report."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    critical_count = sum(1 for f in report.findings if f.severity == "CRITICAL")
+    warning_count = sum(1 for f in report.findings if f.severity == "WARNING")
+    info_count = sum(1 for f in report.findings if f.severity == "INFO")
+
+    # Severity badge classes
+    SEVERITY_CLASSES = {
+        "CRITICAL": "badge-critical",
+        "WARNING": "badge-warning",
+        "INFO": "badge-info",
+    }
+    CATEGORY_ICONS = {
+        "config": "⚙️",
+        "log": "📋",
+        "resource": "📊",
+        "security": "🔒",
+        "topology": "🌐",
+    }
+
+    def _severity_icon(severity: str) -> str:
+        if severity == "CRITICAL":
+            return "🔴"
+        if severity == "WARNING":
+            return "🟡"
+        return "🔵"
+
+    # Build findings rows
+    findings_html = ""
+    for f in report.findings:
+        badge_cls = SEVERITY_CLASSES.get(f.severity, "")
+        icon = CATEGORY_ICONS.get(f.category, "📄")
+        sev_icon = _severity_icon(f.severity)
+        evidence_block = ""
+        if f.evidence:
+            evidence_escaped = f.evidence.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            evidence_block = f'<pre class="evidence">{evidence_escaped}</pre>'
+        file_block = ""
+        if f.file_path:
+            file_escaped = f.file_path.replace("&", "&amp;").replace("<", "&lt;")
+            file_block = f'<div class="finding-file">📄 <code>{file_escaped}</code></div>'
+
+        findings_html += f"""
+    <div class="finding">
+      <div class="finding-header">
+        <span class="badge {badge_cls}">{sev_icon} {f.severity}</span>
+        <span class="finding-category">{icon} {f.category}</span>
+        <span class="finding-title">{f.title}</span>
+      </div>
+      <div class="finding-desc">{f.description}</div>
+      {file_block}
+      {evidence_block}
+      <div class="finding-rec">💡 {f.recommendation}</div>
+    </div>
+"""
+
+    # Build log error/warning tables
+    log_errors_html = ""
+    for fname, entries in sorted(report.log_errors.items()):
+        name_escaped = fname.replace("&", "&amp;").replace("<", "&lt;")
+        rows = ""
+        for entry in entries:
+            count = entry.get("count", 0)
+            file_path = entry.get("file", "")
+            examples = entry.get("examples", [])
+            msg = examples[0] if examples else file_path
+            msg_esc = msg.replace("&", "&amp;").replace("<", "&lt;") if isinstance(msg, str) else str(msg)
+            rows += f'<tr><td class="count">{count}</td><td>{msg_esc}</td></tr>'
+        log_errors_html += f"""
+    <details class="log-section">
+      <summary>❌ {name_escaped} ({len(entries)} error patterns)</summary>
+      <table><tbody>{rows}</tbody></table>
+    </details>
+"""
+
+    log_warnings_html = ""
+    for fname, entries in sorted(report.log_warnings.items()):
+        name_escaped = fname.replace("&", "&amp;").replace("<", "&lt;")
+        rows = ""
+        for entry in entries:
+            count = entry.get("count", 0)
+            file_path = entry.get("file", "")
+            examples = entry.get("examples", [])
+            msg = examples[0] if examples else file_path
+            msg_esc = msg.replace("&", "&amp;").replace("<", "&lt;") if isinstance(msg, str) else str(msg)
+            rows += f'<tr><td class="count">{count}</td><td>{msg_esc}</td></tr>'
+        log_warnings_html += f"""
+    <details class="log-section">
+      <summary>⚠️ {name_escaped} ({len(entries)} warning patterns)</summary>
+      <table><tbody>{rows}</tbody></table>
+    </details>
+"""
+
+    # Build resource stats
+    stats_html = ""
+    for key, value in report.resource_stats.items():
+        key_escaped = key.replace("_", " ").title()
+        stats_html += f'<div class="stat-row"><span class="stat-label">{key_escaped}</span><span class="stat-value">{value}</span></div>\n'
+
+    # Build app inventory
+    app_rows = ""
+    for app_info in sorted(report.app_inventory, key=lambda a: a.get("name", "")):
+        name_esc = app_info.get("name", "").replace("&", "&amp;").replace("<", "&lt;")
+        label_esc = app_info.get("label", "").replace("&", "&amp;").replace("<", "&lt;")
+        ver = app_info.get("version", "unknown")
+        enabled = "✅" if app_info.get("enabled", True) else "❌"
+        app_rows += f'<tr><td>{name_esc}</td><td>{label_esc}</td><td>{ver}</td><td class="center">{enabled}</td></tr>\n'
+
+    # Build recommendations
+    recs_html = ""
+    for i, rec in enumerate(report.recommendations, 1):
+        rec_escaped = rec.replace("&", "&amp;").replace("<", "&lt;")
+        recs_html += f'<li>{rec_escaped}</li>\n'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Splunk Diag Report — {report.diag_info.hostname}</title>
+<style>
+  :root {{
+    --bg:        #0d1117;
+    --bg-card:   #161b22;
+    --bg-hover:  #1c2333;
+    --border:    #30363d;
+    --text:      #e6edf3;
+    --text-dim:  #8b949e;
+    --accent:    #58a6ff;
+    --critical:  #f85149;
+    --warning:   #d29922;
+    --info:      #58a6ff;
+    --success:   #3fb950;
+    --code-bg:   #0d1117;
+    --evidence:  #1a1f2e;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem;
+    max-width: 1100px;
+    margin: 0 auto;
+  }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+
+  /* Header */
+  .header {{
+    text-align: center;
+    padding: 2.5rem 1.5rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin-bottom: 2rem;
+  }}
+  .header h1 {{ font-size: 1.8rem; margin-bottom: 0.5rem; }}
+  .header .subtitle {{ color: var(--text-dim); font-size: 0.95rem; }}
+  .header .meta {{
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    margin-top: 1.2rem;
+    flex-wrap: wrap;
+  }}
+  .header .meta-item {{
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }}
+  .header .meta-label {{ font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }}
+  .header .meta-value {{ font-size: 1.1rem; font-weight: 600; }}
+
+  /* Summary cards */
+  .summary {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2rem;
+  }}
+  .summary-card {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.5rem;
+    text-align: center;
+    transition: transform 0.15s, border-color 0.15s;
+  }}
+  .summary-card:hover {{
+    transform: translateY(-2px);
+    border-color: var(--accent);
+  }}
+  .summary-card .count {{ font-size: 2.4rem; font-weight: 700; }}
+  .summary-card .label {{ font-size: 0.85rem; color: var(--text-dim); margin-top: 0.25rem; }}
+  .count-critical {{ color: var(--critical); }}
+  .count-warning {{ color: var(--warning); }}
+  .count-info {{ color: var(--info); }}
+  .count-total {{ color: var(--text); }}
+
+  /* Section titles */
+  .section-title {{
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin: 2rem 0 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }}
+
+  /* Findings */
+  .finding {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem 1.5rem;
+    margin-bottom: 1rem;
+    transition: background 0.15s;
+  }}
+  .finding:hover {{ background: var(--bg-hover); }}
+  .finding-header {{
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.5rem;
+  }}
+  .badge {{
+    display: inline-block;
+    padding: 0.15rem 0.6rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }}
+  .badge-critical {{ background: rgba(248,81,73,0.15); color: var(--critical); border: 1px solid rgba(248,81,73,0.3); }}
+  .badge-warning {{ background: rgba(210,153,34,0.15); color: var(--warning); border: 1px solid rgba(210,153,34,0.3); }}
+  .badge-info {{ background: rgba(88,166,255,0.15); color: var(--info); border: 1px solid rgba(88,166,255,0.3); }}
+  .finding-category {{
+    color: var(--text-dim);
+    font-size: 0.85rem;
+  }}
+  .finding-title {{
+    font-weight: 600;
+    font-size: 1.05rem;
+  }}
+  .finding-desc {{
+    color: var(--text-dim);
+    margin: 0.5rem 0;
+  }}
+  .finding-file {{
+    margin: 0.5rem 0;
+    font-size: 0.85rem;
+  }}
+  .finding-file code {{
+    background: var(--code-bg);
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.82rem;
+    color: var(--accent);
+  }}
+  .evidence {{
+    background: var(--evidence);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem;
+    margin: 0.5rem 0;
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 0.82rem;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 200px;
+    overflow-y: auto;
+  }}
+  .finding-rec {{
+    margin-top: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: rgba(63,185,80,0.08);
+    border-left: 3px solid var(--success);
+    border-radius: 0 6px 6px 0;
+    font-size: 0.9rem;
+    color: var(--success);
+  }}
+
+  /* Log sections */
+  .log-section {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 0.75rem;
+    overflow: hidden;
+  }}
+  .log-section summary {{
+    padding: 1rem 1.2rem;
+    cursor: pointer;
+    font-weight: 500;
+    user-select: none;
+  }}
+  .log-section summary:hover {{ background: var(--bg-hover); }}
+  .log-section table {{
+    width: 100%;
+    border-collapse: collapse;
+  }}
+  .log-section td {{
+    padding: 0.5rem 1.2rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.88rem;
+  }}
+  .log-section .count {{
+    width: 60px;
+    text-align: center;
+    font-weight: 600;
+    color: var(--critical);
+  }}
+
+  /* Resource stats */
+  .stats-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+  }}
+  .stat-row {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    display: flex;
+    justify-content: space-between;
+  }}
+  .stat-label {{ color: var(--text-dim); }}
+  .stat-value {{ font-weight: 600; }}
+
+  /* App inventory table */
+  .app-table {{
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }}
+  .app-table th {{
+    background: var(--bg-hover);
+    padding: 0.75rem 1rem;
+    text-align: left;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }}
+  .app-table td {{
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.9rem;
+  }}
+  .app-table tr:last-child td {{ border-bottom: none; }}
+  .app-table tr:hover {{ background: var(--bg-hover); }}
+  .app-table .center {{ text-align: center; }}
+
+  /* Recommendations */
+  .recommendations {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem 2rem;
+  }}
+  .recommendations li {{
+    margin-bottom: 0.5rem;
+    padding-left: 0.25rem;
+  }}
+
+  /* Footer */
+  .footer {{
+    text-align: center;
+    margin-top: 3rem;
+    padding: 1.5rem;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    border-top: 1px solid var(--border);
+  }}
+
+  /* Scrollbar */
+  ::-webkit-scrollbar {{ width: 8px; height: 8px; }}
+  ::-webkit-scrollbar-track {{ background: var(--bg); }}
+  ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 4px; }}
+  ::-webkit-scrollbar-thumb:hover {{ background: var(--text-dim); }}
+
+  @media (max-width: 640px) {{
+    body {{ padding: 1rem; }}
+    .header .meta {{ gap: 1rem; }}
+    .summary {{ grid-template-columns: repeat(2, 1fr); }}
+  }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🔍 Splunk Diag Analysis Report</h1>
+  <div class="subtitle">Automated pre-triage — {now}</div>
+  <div class="meta">
+    <div class="meta-item">
+      <span class="meta-label">Host</span>
+      <span class="meta-value">{report.diag_info.hostname or 'N/A'}</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Version</span>
+      <span class="meta-value">{report.diag_info.splunk_version or 'N/A'}</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Type</span>
+      <span class="meta-value">{report.diag_info.deployment_type}</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Size</span>
+      <span class="meta-value">{report.diag_info.total_size_mb:.1f} MB</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Files</span>
+      <span class="meta-value">{report.diag_info.file_count}</span>
+    </div>
+  </div>
+</div>
+
+<div class="summary">
+  <div class="summary-card">
+    <div class="count count-critical">{critical_count}</div>
+    <div class="label">Critical</div>
+  </div>
+  <div class="summary-card">
+    <div class="count count-warning">{warning_count}</div>
+    <div class="label">Warnings</div>
+  </div>
+  <div class="summary-card">
+    <div class="count count-info">{info_count}</div>
+    <div class="label">Informational</div>
+  </div>
+  <div class="summary-card">
+    <div class="count count-total">{len(report.findings)}</div>
+    <div class="label">Total Findings</div>
+  </div>
+</div>
+
+{f'<div class="section-title">🚨 Findings</div>{findings_html}' if findings_html else ''}
+
+{f'<div class="section-title">📋 Log Errors</div>{log_errors_html}' if log_errors_html else ''}
+
+{f'<div class="section-title">⚠️ Log Warnings</div>{log_warnings_html}' if log_warnings_html else ''}
+
+{f'<div class="section-title">📊 Resource Statistics</div><div class="stats-grid">{stats_html}</div>' if stats_html else ''}
+
+{f'<div class="section-title">📦 App Inventory ({len(report.app_inventory)} apps)</div><table class="app-table"><thead><tr><th>Name</th><th>Label</th><th>Version</th><th class="center">Enabled</th></tr></thead><tbody>{app_rows}</tbody></table>' if app_rows else ''}
+
+{f'<div class="section-title">💡 Recommendations</div><ol class="recommendations">{recs_html}</ol>' if recs_html else ''}
+
+<div class="footer">
+  Generated by <strong>splunk-diag-analyzer</strong> — <a href="https://github.com/teksider/splunk-diag-analyzer">github.com/teksider/splunk-diag-analyzer</a><br>
+  This is an automated analysis tool. Always correlate findings with your environment context.
+</div>
+
+</body>
+</html>
+"""
+    return html
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1064,6 +1536,11 @@ def main():
         "--json", "-j",
         action="store_true",
         help="Output as JSON instead of markdown",
+    )
+    parser.add_argument(
+        "--html", "-H",
+        action="store_true",
+        help="Output as dark-themed HTML report",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -1091,7 +1568,9 @@ def main():
 
     report = analyzer.run()
 
-    if args.json:
+    if args.html:
+        output = generate_html_report(report)
+    elif args.json:
         output = generate_json_report(report)
     else:
         output = generate_markdown_report(report)
